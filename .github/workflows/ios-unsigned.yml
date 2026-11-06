@@ -1,0 +1,128 @@
+# 在 GitHub 的 macOS 运行器上构建 fqapp 的未签名 iOS 安装包（IPA）。
+#
+# 用法：把本文件放到仓库的 .github/workflows/ios-unsigned.yml，然后在
+# Actions → "Build iOS unsigned IPA" → Run workflow。
+# 产物：Artifacts → fqapp-ios-unsigned（zip，里面是 fqapp_ios_unsigned.ipa）。
+#
+# 镜像说明：xcode-27 镜像 = macOS 27 + Xcode 27.1/27.2（RC）+ CocoaPods 1.17.0
+# + Rust 1.99.1，正好匹配上游 IOS.md 的要求（Xcode 27.2 / CocoaPods 1.17.0 /
+# Rust 1.99.1 / Flutter 3.47.9）。该镜像是 public preview，排队可能稍慢。
+#
+# 说明：--no-codesign 只保证能编译出 Runner.app，不包含任何签名证书。
+# 安装到 iPhone 需要用 Sideloadly / AltStore 以你自己的 Apple ID 重签；
+# 免费 Apple ID 签名 7 天后过期，过期后重新签一次即可。
+name: Build iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_image:
+        description: Runner image label (xcode-27 = macOS 27 + Xcode 27.x)
+        required: false
+        default: "xcode-27"
+      flutter_version:
+        description: Flutter SDK version
+        required: false
+        default: "3.47.9"
+  push:
+    tags:
+      - "ios-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: ${{ inputs.runner_image || 'xcode-27' }}
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show host toolchain
+        run: |
+          sw_vers
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          pod --version || true
+          rustc --version || true
+          uname -m
+
+      - name: Select Xcode (prefer 27.2)
+        run: |
+          set -euo pipefail
+          pick() { ls -d $1 2>/dev/null | sort -V | tail -1 || true; }
+          preferred=$(pick '/Applications/Xcode_27.2*.app')
+          [ -n "$preferred" ] || preferred=$(pick '/Applications/Xcode_27*.app')
+          [ -n "$preferred" ] || preferred=$(pick '/Applications/Xcode*.app')
+          if [ -z "$preferred" ]; then
+            echo "::error::No Xcode found on this runner image."
+            exit 1
+          fi
+          echo "Using $preferred"
+          sudo xcode-select -s "$preferred/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version || '3.47.9' }}
+          channel: stable
+          cache: true
+
+      - name: Flutter environment
+        run: |
+          flutter --version
+          flutter config --no-enable-swift-package-manager
+          flutter precache --ios
+
+      - name: Ensure Rust iOS target
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+          fi
+          rustup target add aarch64-apple-ios
+          rustc --version
+          rustup target list --installed
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build Rust core as iOS static library
+        run: ./scripts/build_rust_ios.sh
+
+      - name: Build iOS app (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP=build/ios/iphoneos/Runner.app
+          test -d "$APP" || { echo "::error::$APP not found"; exit 1; }
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/Runner.app
+          ( cd build/ipa && zip -qry fqapp_ios_unsigned.ipa Payload )
+          shasum -a 256 build/ipa/fqapp_ios_unsigned.ipa
+          ls -lh build/ipa/fqapp_ios_unsigned.ipa
+          {
+            echo "### iOS unsigned IPA"
+            echo "- file: \`fqapp_ios_unsigned.ipa\`"
+            echo "- size: $(du -h build/ipa/fqapp_ios_unsigned.ipa | cut -f1)"
+            echo "- sha256: \`$(shasum -a 256 build/ipa/fqapp_ios_unsigned.ipa | cut -d' ' -f1)\`"
+            echo ""
+            echo "未签名包，需用 Sideloadly/AltStore 以 Apple ID 重签后安装。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-ios-unsigned
+          path: build/ipa/fqapp_ios_unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
