@@ -94,7 +94,9 @@ jobs:
         run: flutter pub get
 
       - name: Build Rust core as iOS static library
-        run: ./scripts/build_rust_ios.sh
+        # 仓库里这些 .sh 的 git mode 是 100644（没有执行位），上游 Android CI
+        # 也统一用 `bash scripts/...` 调用，所以这里不能写 ./scripts/...。
+        run: bash ./scripts/build_rust_ios.sh
 
       - name: Build iOS app (unsigned)
         run: flutter build ios --release --no-codesign
